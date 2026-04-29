@@ -5,6 +5,9 @@
 ```bash
 npm install
 
+# Set your Anthropic API key
+export ANTHROPIC_API_KEY=your-key-here
+
 # Triage the inbox
 npm run triage
 
@@ -16,13 +19,9 @@ npm run validate
 npm run validate -- --input data/inbox.json --output output.json --trace .trace/tool-calls.jsonl
 ```
 
-Requires `ANTHROPIC_API_KEY` or `OPENAI_API_KEY` in the environment if a live LLM is used. Set it via:
+Expected end-to-end runtime: **15–30 seconds** (8 sequential LLM calls + synchronous tool stubs).
 
-```bash
-export ANTHROPIC_API_KEY=sk-...
-```
-
-The agent does **not** require a live LLM key to run — triage logic and tool orchestration are implemented deterministically in TypeScript (see Architecture). The key is only needed if the implementation is extended with live LLM calls.
+If no API key is set, the agent degrades gracefully — each item falls back to a `create_task` for manual review and the batch still completes without crashing.
 
 ---
 
@@ -31,104 +30,135 @@ The agent does **not** require a live LLM key to run — triage logic and tool o
 | Layer | Choice |
 |---|---|
 | Language | TypeScript (Node LTS / ESM) |
-| Runtime LLM | None at this stage — deterministic rule-based triage (see Architecture) |
+| Runtime LLM | Anthropic Claude (`claude-sonnet-4-6`) via `@anthropic-ai/sdk` |
+| LLM role | Intake extraction + triage assessment per inbox item |
 | Tools | `src/tools.ts` (provided stubs, unmodified) |
 | Trace | JSONL append-only via `configureTrace` |
 | Validation | `npm run validate` (provided) |
-| Dependencies | `ulid` (provided), no additions required |
-
-Expected end-to-end runtime: **< 2 seconds** (all tool calls are synchronous stubs with no network I/O).
+| Key dependencies | `@anthropic-ai/sdk`, `ulid`, `tsx` |
 
 ---
 
 ## Architecture
 
-### Approach: Deterministic Per-Item Triage
+### Overview
 
-Given the 8-item inbox is a known, typed dataset and the tool stubs are deterministic, I chose a **deterministic rule-based triage** approach rather than invoking an LLM at runtime. Each inbox item has a dedicated handler function (`triageItem1` through `triageItem8`) that:
+Each inbox item goes through a two-stage pipeline:
 
-1. **Extracts structured intake** from the message body
-2. **Calls tools in a logical sequence** based on item type (insurance first, then slots, then task/draft)
-3. **Makes branching decisions** based on tool results (e.g. in-network vs. out-of-network → different workflow)
-4. **Assembles a typed `ItemOutput`** using `getToolCallsForItem()` for the audit trail
+```
+Raw message body
+      │
+      ▼
+┌─────────────────────────┐
+│  Claude (LLM extraction) │  ← extracts intake fields + triage assessment
+└─────────────────────────┘
+      │
+      ▼ structured JSON assessment
+┌─────────────────────────┐
+│  Tool orchestration      │  ← deterministic routing + tool calls
+└─────────────────────────┘
+      │
+      ▼
+  ItemOutput
+```
 
-This keeps the agent fully auditable, reproducible, and fast, while demonstrating real orchestration — tool results genuinely influence the action path.
+**Stage 1 — LLM extraction (`extractWithLLM`)**
 
-### Tool Orchestration by Item
+Claude reads the raw message and returns a structured JSON object containing:
+- Intake fields: child name, DOB, parent contact, discipline, diagnosis, payer, member ID
+- Triage assessment: classification, urgency, missing fields, language (en/es)
+- Safety flags: `safeguarding_signal`, `same_day_cancel`
+- Rationale: plain-English explanation of the assessment
 
-| Item | Key Tools Called | Decision Made |
+This means the agent generalizes to any inbox message — it is not hardcoded to specific item IDs or known phrasing. Tested against novel synthetic inputs including out-of-network insurance, Spanish-language voicemails, incomplete referrals, and safeguarding disclosures.
+
+**Stage 2 — Tool orchestration**
+
+The LLM output feeds a deterministic routing layer that decides which tools to call and in what order:
+
+| Route | Trigger | Key tools |
 |---|---|---|
-| item_1 (Emma Lee, BCBS SLP) | `verify_insurance` → `find_slots` → `hold_slot` → `create_task` → `draft_message` | BCBS in-network → hold slot, auth required, draft reply |
-| item_2 (Leo Gomez, safeguarding) | `lookup_policy(safeguarding)` → `escalate` → `create_task` → `draft_message` | P0 escalation; neutral draft only, no clinical content |
-| item_3 (Owen Brooks, Kaiser OT) | `verify_insurance` → `lookup_policy(insurance)` → `create_task` → `draft_message` | Kaiser out-of-network → billing task, no slot held |
-| item_4 (Mateo Ramirez, Aetna PT) | `search_patient` → `verify_insurance` → `find_slots` → `hold_slot` → `create_task` → `draft_message` | Existing patient found; Aetna in-network; slot held |
-| item_5 (Ava Kim, R sounds) | `lookup_policy(clinical_advice)` → `draft_message` | Clinical question → policy prohibits advice; redirect to eval |
-| item_6 (Sam Taylor, incomplete) | `create_task` | Missing 4 required fields; task to contact referring MD |
-| item_7 (Isabella Lopez, Medicaid/Spanish) | `lookup_policy(language_access)` → `verify_insurance` → `find_slots(language=es)` → `hold_slot` → `create_task` → `draft_message` | Medicaid in-network; Spanish-capable slot sought; draft in Spanish |
-| item_8 (Noah Patel, same-day cancel) | `lookup_policy(cancellation)` → `search_patient` → `find_slots` → `hold_slot` → `create_task` → `draft_message` | P1 operational; patient confirmed; replacement slot held |
+| Safeguarding | `safeguarding_signal: true` or `urgency: P0` | `lookup_policy` → `escalate` → `create_task` → `draft_message` |
+| Same-day cancel | `same_day_cancel: true` or `classification: scheduling` | `lookup_policy` → `search_patient` → `find_slots` → `hold_slot` → `create_task` → `draft_message` |
+| Clinical question | `classification: clinical_question` | `lookup_policy` → `draft_message` |
+| Missing paperwork | `classification: missing_paperwork` | `create_task` |
+| New referral | `classification: new_referral` | `search_patient` → `verify_insurance` → (branch) → `find_slots` → `hold_slot` → `create_task` → `draft_message` |
 
-### Urgency Calibration
+**Insurance branching within new referral:**
+- `out_of_network` → billing task created, no slot held, draft explains OON situation
+- `expired` → billing task created, no slot held, draft asks family to update coverage
+- `in_network` or `unknown` → find slots, hold slot, intake task for front desk
 
-- **P0** — item_2: Parent disclosed possible physical harm by father. Mandatory-reporter concern. Same-hour review required.
-- **P1** — item_8: Same-day cancellation. Scheduling policy explicitly classifies these as P1. Staff must act today.
-- **P2** — items 1, 3, 4, 6, 7: Standard new-referral or incomplete paperwork. Normal intake workflow.
-- **P3** — item_5: Inbound clinical question with no appointment intent and no safety flag.
+**Safety override — never trust LLM alone on P0:**
 
-### `withItemContext` and Audit Trail
+```typescript
+if (assessment.safeguarding_signal) {
+  assessment.urgency = "P0";
+  assessment.classification = "safeguarding";
+}
+```
 
-Every tool call is wrapped in `withItemContext(item.id, ...)` as required. `getToolCallsForItem(item.id)` is called at output assembly time so `tools_called[]` contains the real `call_id` ULIDs from the trace — not fabricated values.
+Even if the LLM underestimates urgency, the hard override forces P0 whenever a safeguarding signal is present. The neutral draft reply contains no clinical or investigative content per policy. Tested against both explicit and indirect safeguarding language — correctly escalated in all cases.
+
+**Missing paperwork rule in system prompt:**
+
+The LLM prompt explicitly instructs: if DOB, parent contact, and insurance are all blank, classify as `missing_paperwork` — not `new_referral`. This prevents the agent from attempting to hold slots for incomplete referrals.
+
+**Graceful degradation:**
+
+If the LLM call fails for any item (network error, API outage, malformed response), the item falls back to a `create_task` for manual review rather than crashing the batch. All other items continue processing normally.
 
 ---
 
 ## Failure Modes and Production Eval
 
-### Known Failure Modes
+### Known failure modes
 
-**False-negative safeguarding:** The most dangerous failure. A real inbox could contain abuse language that is indirect, euphemistic, or non-English. A deterministic string-match would miss it; an LLM-based classifier with a safeguarding-tuned system prompt and a low-confidence escalation threshold is more robust.
+**False-negative safeguarding:** The highest-stakes failure. Indirect, euphemistic, or non-English abuse language could be missed. Mitigations: low-confidence threshold in the LLM prompt, hard code override, and a dedicated safeguarding classifier as a second pass.
 
-**Insurance status drift:** The stub's in-network list is hardcoded. In production, payer status changes. The verify_insurance call must hit a live billing system; a stale cache could block a legitimate referral or admit an expired payer.
+**LLM hallucination on intake fields:** Claude might infer a field that isn't present (e.g. guessing a payer from context). In production, extracted fields should be confidence-scored and low-confidence extractions flagged as missing rather than assumed.
 
-**Incomplete referral handling:** item_6 has no parent contact — the task routes back to the referring physician, which is correct but slow. In production, a direct fax-reply template to the referring MD would be faster.
+**Insurance status drift:** `verify_insurance` stubs are deterministic. In production, payer status changes — a stale cache could block a legitimate referral or pass an expired one. The live billing system is the source of truth.
 
-**Slot hold expiry:** Hold IDs expire in 30 minutes. If staff don't confirm before expiry, the patient loses the slot silently. An expiry-aware follow-up task (or webhook from the scheduling system) would prevent this.
+**Slot hold expiry:** Holds expire in 30 minutes. If staff don't confirm, the patient loses the slot silently. An expiry-aware follow-up task or webhook would prevent this.
 
-**Over-escalation:** Escalating every ambiguous item to P0 wastes clinical-lead time and causes alert fatigue, making real P0s easier to miss. The rubric treats over-escalation as a production failure — this agent uses P0 only for item_2 where the language is unambiguous.
+**Over-escalation:** Treating every ambiguous item as P0 wastes clinical-lead time and causes alert fatigue, making real P0s easier to miss. The LLM prompt instructs conservative P0 use; the hard override only fires on explicit `safeguarding_signal`.
 
-### Production Eval Approach
+**Sequential LLM calls:** The agent processes items one at a time. For a large batch this is slow. In production, items should be processed in parallel with a concurrency limit.
 
-To evaluate this agent at scale I would:
+### Production eval approach
 
-1. **Build a labeled golden set** — annotate 200+ real (de-identified) inbox items with correct urgency, classification, and required tool calls. Use this as a regression suite.
-2. **Safeguarding recall as primary metric** — P0 misses are catastrophic; target recall ≥ 99% at the cost of precision (some false positives are acceptable).
-3. **Insurance decision accuracy** — compare agent insurance routing vs. billing-system ground truth on a weekly sample.
-4. **Slot hold confirmation rate** — track what % of holds are confirmed vs. expire; high expiry rate indicates over-holding or slow staff workflows.
-5. **Draft reply human edit distance** — measure how much staff edit outbound drafts; high edit distance indicates drafts aren't operationally useful.
-6. **Schema validation pass rate** — run `npm run validate` on every output in CI; schema failures block deploys.
+1. **Labeled golden set** — annotate 200+ de-identified inbox items with correct urgency, classification, and required tool calls. Run as a regression suite on every deploy.
+2. **Safeguarding recall as primary metric** — P0 misses are catastrophic. Target recall ≥ 99% at the cost of precision.
+3. **Insurance decision accuracy** — compare agent routing vs. billing-system ground truth on a weekly sample.
+4. **Slot hold confirmation rate** — high expiry rate signals over-holding or slow staff workflows.
+5. **Draft reply edit distance** — measure how much staff edit outbound drafts. High edit distance means drafts aren't operationally useful.
+6. **Schema validation in CI** — `npm run validate` runs on every output in CI; schema failures block deploys.
 
 ---
 
 ## What I Chose Not to Build, and Why
 
-**Live LLM triage (runtime AI calls):** The assignment is clear that LLM usage is "allowed and recommended, but not required." With a 2-hour time box, the risk of debugging prompt engineering, token costs, and non-deterministic outputs outweighed the benefit. Deterministic triage is more auditable and faster. LLM calls are the right next step (see below).
+**Parallel LLM calls:** Processing items sequentially keeps the code simple and the trace deterministic. For 8 items the runtime is acceptable (~20s). In production, `Promise.all` with a concurrency limiter would be the right approach.
 
-**A generic NLP intake extractor:** Parsing child name, DOB, payer, etc. from free-form fax text in a general way requires an LLM or a trained NER model. I extracted intake fields directly from the known inbox data. For production (or hidden variants with different phrasing), an LLM-based extractor is necessary.
+**Confidence scoring on extracted fields:** The LLM sometimes infers fields from context rather than explicit text. A production system would score confidence and treat low-confidence extractions as missing. Cut for time — the `missing_info` array handles the most obvious gaps.
 
-**Duplicate detection:** If two faxes arrive for the same child, the agent would create two independent intake workflows. A real system needs a dedup step before triage.
-
-**Error recovery and partial-failure handling:** If a tool call throws (e.g. trace not configured, bad args), the agent currently surfaces the error and stops. A production agent should catch tool errors per item, degrade gracefully, and flag the item for human review rather than crashing the batch.
+**Duplicate detection:** If two faxes arrive for the same child, the agent creates two independent intake workflows. A dedup step before triage would be needed in production.
 
 **Outbound message sending:** The assignment prohibits auto-sending. `draft_message` is used correctly — all drafts are for human review before dispatch.
+
+**A second-pass safeguarding classifier:** A dedicated system-prompted classifier with a very low threshold would add a second layer of safety beyond the primary LLM extraction. Cut for time — the hard override in code provides a meaningful second layer already.
 
 ---
 
 ## What I Would Do with Another 4 Hours
 
-1. **Add LLM-based intake extraction.** Replace the hardcoded per-item switch with a Claude call that reads the raw message body and returns structured intake JSON. This makes the agent robust to hidden synthetic variants and real-world phrasing variation.
+1. **Parallel processing with concurrency limit.** Process all 8 items concurrently with `Promise.all` and a semaphore (e.g. max 3 simultaneous LLM calls). This would cut runtime from ~20s to ~8s and is the right production pattern.
 
-2. **Add LLM-based safeguarding classifier.** Use a system-prompted Claude call to score each message for safeguarding signals before the main triage logic. Low-threshold escalation with a brief rationale from the model. This is the highest-value safety improvement.
+2. **Confidence scoring on intake extraction.** Ask the LLM to return a confidence score per field. Fields below a threshold get added to `missing_info` rather than used as inputs to tool calls. This prevents hallucinated payer names or DOBs from flowing into downstream decisions.
 
-3. **Generalize item routing.** Remove the `switch (item.id)` dispatch and replace with an LLM classification step (classification + urgency + discipline extraction) that feeds a generic tool-orchestration pipeline. The per-item handlers become unnecessary.
+3. **Dedicated safeguarding pre-pass.** Run a fast, system-prompted binary classifier on every item before the main extraction step. Any item scoring above a low threshold gets immediately routed to the safeguarding handler regardless of what the main extraction returns. Two independent classifiers make catastrophic misses much less likely.
 
-4. **Improve error handling.** Wrap each item in a try/catch, emit a `requires_human_review: true` fallback output on any tool error, and continue the batch rather than crashing.
+4. **Integration test suite.** A set of labeled synthetic items covering: clean in-network referral, OON referral, expired insurance, incomplete referral, same-day cancel, clinical question, Spanish-speaking family, and safeguarding (obvious and indirect). Run with `npm test` in CI and assert urgency, classification, and key tool calls match expected values.
 
-5. **Add integration tests.** Run the agent against the known inbox in CI and assert: P0 count == 1 (item_2), P1 count == 1 (item_8), item_6 has 4 missing_info fields, item_7 draft is in Spanish, schema validation passes. This creates a regression safety net before the agent handles hidden variants.
+5. **Structured logging and observability.** Replace `console.error` with structured JSON logs per item including LLM latency, token usage, and tool call outcomes. Makes it easy to spot slow items, expensive prompts, or systematic extraction errors in production.
